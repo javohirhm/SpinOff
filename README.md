@@ -74,9 +74,15 @@ All datasets are preprocessed to maintain consistent voxel size, slice thickness
 ## 📁 Repository Structure
 
 ├── data/ # Datasets
+
 ├── models/ # Model architectures
+
 ├── notebooks/ # Experiment notebooks
+
 ├── scripts/ # Preprocessing & training scripts
+
 ├── results/ # Output images and metrics
+
 ├── README.md # Project overview
+
 └── requirements.txt # Dependencies
