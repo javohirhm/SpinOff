@@ -1,5 +1,9 @@
 # SpinOff
 
+Team:
+- Javohirbek Khoshimov - 220899
+- Gulrukhsor Akhmadjanova - 220243
+
 # 🧠 Diffusion Super-Resolution for Low-Dose CT/MRI
 
 ### 📍 Overview
