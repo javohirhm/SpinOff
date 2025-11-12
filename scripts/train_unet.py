@@ -6,16 +6,21 @@ It uses data/dataset.py and utils/metrics.py from this repo.
 """
 
 import os
+import sys
 import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Internal imports (based on your repo layout)
+# --- Path fix for Colab and local runs ---
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# --- Now these imports will work ---
 from data.dataset import IXIDataset
 from models.unet import UNet
 from utils.metrics import psnr, ssim
+
 
 
 def parse_args():
