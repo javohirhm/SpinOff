@@ -17,7 +17,7 @@ from tqdm import tqdm
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # --- Now these imports will work ---
-from data.dataset import IXIDataset
+from data.dataset import MRIDataset
 from models.unet import UNet
 from utils.metrics import psnr, ssim
 
