@@ -1,4 +1,19 @@
+"""
+Train U-Net baseline for Diffusion Super-Resolution (SpinOff)
 
+This script matches the exact interfaces in your repository:
+- data/dataset.py -> MRIDataset(hr_paths, lr_paths=None, transform=None, create_lr_on_fly=False, scale_factor=2, noise_level=0.02, ...)
+- models/unet.py -> class UNet(...)
+- utils/metrics.py -> functions calculate_psnr, calculate_ssim
+
+Usage:
+cd /content/SpinOff
+!python scripts/train_unet.py \
+  --splits "/content/drive/MyDrive/SpinOff_Project/data/IXI/processed/png_slices/splits.json" \
+  --epochs 2 --batch_size 4 \
+  --save_dir "/content/drive/MyDrive/SpinOff_Project/results/unet_test" \
+  --create_lr_on_fly
+"""
 
 import os
 import sys
@@ -10,8 +25,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+# Ensure repo root (one level up from scripts/) is visible for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Repo imports (aligned to your structure)
 from data.dataset import MRIDataset
 from models.unet import UNet
 from utils.metrics import calculate_psnr, calculate_ssim
@@ -126,42 +143,57 @@ def main():
 
     # Model, optimizer, and loss
     model = UNet(in_channels=1, out_channels=1).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    criterion = nn.L1Loss()
 
     # ---- Resume training from checkpoint if exists ----
+    start_epoch = 1
+    best_psnr = -1.0
     resume_path = os.path.join(args.save_dir, "unet_final.pt")
+
     if os.path.exists(resume_path):
         print(f"🔄 Resuming training from checkpoint: {resume_path}")
-        model.load_state_dict(torch.load(resume_path, map_location=device))
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+        if "optimizer_state" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+        start_epoch = checkpoint.get("epoch", 0) + 1
+        best_psnr = checkpoint.get("best_psnr", -1.0)
+        print(f"➡️ Resuming from epoch {start_epoch} | Best PSNR so far: {best_psnr:.4f}")
     else:
         print("⚠️ No checkpoint found — starting new training.")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.L1Loss()
-    best_psnr = -1.0
-
     # ---- Training loop ----
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         print(f"\n=== Epoch {epoch}/{args.epochs} ===")
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_psnr, val_ssim = validate(model, val_loader, device)
 
         print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val PSNR: {val_psnr:.4f} | Val SSIM: {val_ssim:.4f}")
 
-        # Save best checkpoint
+        # Save checkpoint dict
+        checkpoint = {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "best_psnr": max(best_psnr, val_psnr)
+        }
+
+        # Save best model
         if val_psnr > best_psnr:
             best_psnr = val_psnr
             best_path = os.path.join(args.save_dir, "unet_best.pt")
-            torch.save(model.state_dict(), best_path)
+            torch.save(checkpoint, best_path)
             print(f"✅ New best saved: {best_path}")
 
         # Save per-epoch and rolling checkpoints
         epoch_path = os.path.join(args.save_dir, f"unet_epoch{epoch}.pt")
-        torch.save(model.state_dict(), epoch_path)
-        torch.save(model.state_dict(), os.path.join(args.save_dir, "unet_latest.pt"))
+        torch.save(checkpoint, epoch_path)
+        torch.save(checkpoint, os.path.join(args.save_dir, "unet_latest.pt"))
 
     # Final save
     final_path = os.path.join(args.save_dir, "unet_final.pt")
-    torch.save(model.state_dict(), final_path)
+    torch.save(checkpoint, final_path)
     print(f"\n🎯 Training finished. Final saved to: {final_path}")
     print(f"Best val PSNR: {best_psnr:.4f}")
 
