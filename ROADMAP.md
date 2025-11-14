@@ -6,11 +6,11 @@
 
 **Project:** Diffusion Super-Resolution for Low-Dose CT/MRI  
 **Team:** Gulrukhsor Akhmadjanova, Javohir Khoshimov  
-**Duration:** 8 Weeks (Oct 21 - Dec 13, 2025)
+**Duration:** 8 Weeks 
 
 ## 📅 Weekly Milestones
 
-### Week 1 (Oct 21-27): Project Setup & Data Foundation
+### Week 1✅: Project Setup & Data Foundation
 **Owner:** Both  
 **Deliverables:**
 - ✅ Team formation and project selection
@@ -19,13 +19,13 @@
 - ✅ Basic environment configuration
 - ✅ Proposal submission (Midterm)
 
-**Progress:**
+
 - Repository created with MIT license
 - Initial project structure established
 - Dataset access verified
 - Proposal submitted and approved
 
-### Week 2 (Oct 28-Nov 3): Data Pipeline & U-Net Implementation
+### Week 2✅: Data Pipeline & U-Net Implementation
 **Primary Owner:** Javohir  
 **Support:** Gulrukhsor  
 **Deliverables:**
@@ -41,9 +41,9 @@
 - [ ] Set up data loaders with augmentation
 - [ ] Create basic training loop skeleton
 
-### Week 3 (Nov 4-10): U-Net Training & Baseline Establishment
-**Primary Owner:** Javohir  
-**Support:** Gulrukhsor  
+### Week 3 ✅ : U-Net Training & Baseline Establishment
+**Primary Owner:** Gulrukhsor  
+**Support:** Javohir  
 **Deliverables:**
 - Trained U-Net baseline model
 - Initial evaluation metrics
