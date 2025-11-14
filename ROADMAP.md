@@ -73,7 +73,7 @@
 - [ ] Evaluate GAN performance vs U-Net
 - [ ] Analyze texture quality improvements
 
-### Week 5 (Nov 18-24): Diffusion Model Implementation
+### Week 5 : Diffusion Model Implementation
 **Primary Owner:** Gulrukhsor  
 **Support:** Javohir  
 **Deliverables:**
@@ -89,7 +89,7 @@
 - [ ] Set up diffusion training loop
 - [ ] Optimize for T4 GPU memory constraints
 
-### Week 6 (Nov 25-Dec 1): Diffusion Training & Interim Evaluation
+### Week 6: Diffusion Training & Interim Evaluation
 **Primary Owner:** Gulrukhsor  
 **Support:** Javohir  
 **Deliverables:**
@@ -105,7 +105,7 @@
 - [ ] Conduct initial ablation (noise schedules)
 - [ ] Generate qualitative comparisons
 
-### Week 7 (Dec 2-8): Comprehensive Evaluation & Analysis
+### Week 7 : Comprehensive Evaluation & Analysis
 **Owner:** Both  
 **Deliverables:**
 - Complete quantitative evaluation
@@ -120,7 +120,7 @@
 - [ ] Optimize final model parameters
 - [ ] Prepare results visualization
 
-### Week 8 (Dec 9-13): Final Integration & Submission
+### Week 8 : Final Integration & Submission
 **Owner:** Both  
 **Deliverables:**
 - Final trained models
@@ -166,9 +166,5 @@
 - ✅ Proposal submitted and approved
 - ✅ Initial environment setup completed
 
-*Next: Begin data preprocessing and U-Net implementation*
 
----
 
-**Last Updated:** October 27, 2025  
-**Next Review:** November 3, 2025
