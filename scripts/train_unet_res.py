@@ -1,4 +1,4 @@
-%%writefile /content/SpinOff/scripts/train_unet_resume.py
+%%writefile /content/SpinOff/scripts/train_unet_res.py
 """
 Resume-capable trainer for SpinOff U-Net Super-Resolution.
 Fully compatible with your original train_unet.py.
