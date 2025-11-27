@@ -224,6 +224,7 @@ class SR3UNet(nn.Module):
     """
     U-Net architecture for SR3 diffusion model.
     Conditions on low-resolution images for super-resolution.
+    Works with LR input at original resolution (no upsampling required).
     """
     def __init__(
         self,
@@ -235,13 +236,15 @@ class SR3UNet(nn.Module):
         time_emb_dim: int = 256,
         attention_resolutions: Tuple[int, ...] = (16,),
         dropout: float = 0.1,
-        image_size: int = 128
+        image_size: int = 128,
+        lr_scale: int = 2
     ):
         super().__init__()
         
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.image_size = image_size
+        self.lr_scale = lr_scale
         
         # Time embedding
         self.time_mlp = nn.Sequential(
@@ -251,11 +254,16 @@ class SR3UNet(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim)
         )
         
-        # Conditioning projection (for low-resolution input)
-        self.cond_proj = nn.Conv2d(in_channels, base_channels, 3, padding=1)
-        
         # Initial convolution for noisy high-res input
         self.init_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+        
+        # Conditioning: upsample LR then project
+        # This matches the U-Net approach where LR is upsampled internally
+        self.cond_upsample = nn.Sequential(
+            nn.ConvTranspose2d(in_channels, base_channels, kernel_size=4, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1)
+        )
         
         # Downsampling path
         self.downs = nn.ModuleList()
@@ -317,7 +325,7 @@ class SR3UNet(nn.Module):
         Args:
             x: Noisy high-resolution image [B, C, H, W]
             time: Diffusion timestep [B]
-            cond: Low-resolution conditioning image [B, C, H, W]
+            cond: Low-resolution conditioning image [B, C, H/2, W/2]
         
         Returns:
             Predicted noise [B, C, H, W]
@@ -325,8 +333,8 @@ class SR3UNet(nn.Module):
         # Time embedding
         time_emb = self.time_mlp(time)
         
-        # Condition embedding
-        cond_emb = self.cond_proj(cond)
+        # Upsample and project conditioning (LR -> HR resolution)
+        cond_emb = self.cond_upsample(cond)
         
         # Initial projection with conditioning
         x = self.init_conv(x)
@@ -569,7 +577,8 @@ def create_sr3_model(
     in_channels: int = 1,
     base_channels: int = 64,
     timesteps: int = 1000,
-    beta_schedule: str = 'linear'
+    beta_schedule: str = 'linear',
+    lr_scale: int = 2
 ) -> Tuple[SR3UNet, GaussianDiffusion]:
     """
     Factory function to create SR3 model and diffusion process.
@@ -580,6 +589,7 @@ def create_sr3_model(
         base_channels: Base number of channels in U-Net
         timesteps: Number of diffusion steps
         beta_schedule: Noise schedule ('linear' or 'cosine')
+        lr_scale: Upsampling scale factor (2 for 2x SR)
     
     Returns:
         Tuple of (model, diffusion)
@@ -593,7 +603,8 @@ def create_sr3_model(
         time_emb_dim=base_channels * 4,
         attention_resolutions=(16,),
         dropout=0.1,
-        image_size=image_size
+        image_size=image_size,
+        lr_scale=lr_scale
     )
     
     diffusion = GaussianDiffusion(
