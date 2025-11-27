@@ -1,631 +1,252 @@
 """
-SR3: Image Super-Resolution via Iterative Refinement
-Implementation for medical image super-resolution baseline
-Based on: Saharia et al. (2021) - https://arxiv.org/abs/2104.07636
-
-This implementation provides a diffusion-based baseline for comparison
-with the main DiT/SiT approach in the SpinOff project.
+Resume-capable trainer for SpinOff SR3 Super-Resolution.
+Fully compatible with your training workflow and checkpoint system.
 """
+
+import os
+import sys
+import re
+import json
+import argparse
+from tqdm import tqdm
+from glob import glob
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
-from typing import Optional, Tuple
+from torch.utils.data import DataLoader
+
+# Add repo root to Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from data.dataset import MRIDataset
+from models.sr3 import create_sr3_model
+from utils.metrics import calculate_psnr, calculate_ssim
 
 
-class SinusoidalPositionEmbeddings(nn.Module):
-    """
-    Sinusoidal time step embeddings for diffusion models.
-    """
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, time: torch.Tensor) -> torch.Tensor:
-        device = time.device
-        half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
+# ---------------------------------------------------------------
+# Helper: infer last epoch from sr3_epochN.pt files
+# ---------------------------------------------------------------
+def infer_last_epoch(save_dir):
+    pattern = re.compile(r"sr3_epoch(\d+)\.pt$")
+    max_epoch = 0
+    for p in glob(os.path.join(save_dir, "sr3_epoch*.pt")):
+        m = pattern.search(os.path.basename(p))
+        if m:
+            n = int(m.group(1))
+            max_epoch = max(max_epoch, n)
+    return max_epoch
 
 
-class ResidualBlock(nn.Module):
-    """
-    Residual block with time embedding and conditional input.
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        time_emb_dim: int,
-        dropout: float = 0.1,
-        use_attention: bool = False
-    ):
-        super().__init__()
-        self.use_attention = use_attention
-        
-        # Time embedding projection
-        self.time_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, out_channels)
-        )
-        
-        # First convolution block
-        self.conv1 = nn.Sequential(
-            nn.GroupNorm(32, in_channels),
-            nn.SiLU(),
-            nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        )
-        
-        # Second convolution block
-        self.conv2 = nn.Sequential(
-            nn.GroupNorm(32, out_channels),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        )
-        
-        # Skip connection
-        if in_channels != out_channels:
-            self.skip = nn.Conv2d(in_channels, out_channels, 1)
-        else:
-            self.skip = nn.Identity()
-        
-        # Self-attention (optional)
-        if use_attention:
-            self.attention = SelfAttention(out_channels)
-    
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(x)
-        
-        # Add time embedding
-        time_emb = self.time_mlp(time_emb)
-        h = h + time_emb[:, :, None, None]
-        
-        h = self.conv2(h)
-        
-        # Skip connection
-        h = h + self.skip(x)
-        
-        # Apply attention if specified
-        if self.use_attention:
-            h = self.attention(h)
-        
-        return h
+# ---------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="SpinOff SR3 Trainer with Resume Support")
+
+    p.add_argument("--splits", required=True, help="Path to splits JSON file")
+    p.add_argument("--epochs", type=int, default=20, help="Total epochs to train")
+    p.add_argument("--batch_size", type=int, default=4, help="Batch size (smaller for diffusion)")
+    p.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
+    p.add_argument("--save_dir", type=str, default="./results/sr3", help="Directory to save checkpoints")
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+
+    # Data arguments
+    p.add_argument("--create_lr_on_fly", action="store_true", help="Create LR images on-the-fly")
+    p.add_argument("--scale", type=int, default=2, help="Downsampling scale factor")
+    p.add_argument("--noise_level", type=float, default=0.02, help="Noise level for degradation")
+
+    # SR3 specific arguments
+    p.add_argument("--image_size", type=int, default=128, help="High-res image size")
+    p.add_argument("--timesteps", type=int, default=1000, help="Number of diffusion steps")
+    p.add_argument("--beta_schedule", type=str, default="linear", choices=["linear", "cosine"])
+    p.add_argument("--base_channels", type=int, default=64, help="Base channels in U-Net")
+    p.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
+    p.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate")
+    p.add_argument("--use_ema", action="store_true", help="Use exponential moving average")
+
+    return p.parse_args()
 
 
-class SelfAttention(nn.Module):
-    """
-    Self-attention mechanism for spatial features.
-    """
-    def __init__(self, channels: int, num_heads: int = 4):
-        super().__init__()
-        self.channels = channels
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        
-        assert channels % num_heads == 0, "channels must be divisible by num_heads"
-        
-        self.norm = nn.GroupNorm(32, channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, 1)
-        self.proj = nn.Conv2d(channels, channels, 1)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        
-        # Normalize
-        h = self.norm(x)
-        
-        # Compute Q, K, V
-        qkv = self.qkv(h)
-        qkv = qkv.reshape(B, 3, self.num_heads, self.head_dim, H * W)
-        qkv = qkv.permute(1, 0, 2, 4, 3)  # (3, B, num_heads, H*W, head_dim)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # Attention
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        
-        # Apply attention to values
-        h = torch.matmul(attn, v)
-        h = h.permute(0, 1, 3, 2).reshape(B, C, H, W)
-        
-        # Project
-        h = self.proj(h)
-        
-        # Residual
-        return x + h
+# ---------------------------------------------------------------
+def make_dataloaders(splits_file, batch_size, create_lr_on_fly, scale_factor, noise_level):
+    with open(splits_file, "r") as f:
+        splits = json.load(f)
+
+    train_paths = splits.get("train", [])
+    val_paths = splits.get("val", [])
+
+    train_ds = MRIDataset(
+        hr_paths=train_paths,
+        lr_paths=None,
+        transform=None,
+        create_lr_on_fly=create_lr_on_fly,
+        scale_factor=scale_factor,
+        noise_level=noise_level
+    )
+    val_ds = MRIDataset(
+        hr_paths=val_paths,
+        lr_paths=None,
+        transform=None,
+        create_lr_on_fly=create_lr_on_fly,
+        scale_factor=scale_factor,
+        noise_level=noise_level
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                              shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size,
+                            shuffle=False, num_workers=2, pin_memory=True)
+    return train_loader, val_loader
 
 
-class DownBlock(nn.Module):
-    """
-    Downsampling block with residual connections.
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        time_emb_dim: int,
-        num_layers: int = 2,
-        use_attention: bool = False
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            ResidualBlock(
-                in_channels if i == 0 else out_channels,
-                out_channels,
-                time_emb_dim,
-                use_attention=use_attention
-            )
-            for i in range(num_layers)
-        ])
-        self.downsample = nn.Conv2d(out_channels, out_channels, 4, stride=2, padding=1)
-    
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        for layer in self.layers:
-            x = layer(x, time_emb)
-        skip = x
-        x = self.downsample(x)
-        return x, skip
-
-
-class UpBlock(nn.Module):
-    """
-    Upsampling block with residual connections and skip connections.
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        time_emb_dim: int,
-        num_layers: int = 2,
-        use_attention: bool = False
-    ):
-        super().__init__()
-        self.upsample = nn.ConvTranspose2d(in_channels, in_channels, 4, stride=2, padding=1)
-        self.layers = nn.ModuleList([
-            ResidualBlock(
-                in_channels + out_channels if i == 0 else out_channels,
-                out_channels,
-                time_emb_dim,
-                use_attention=use_attention
-            )
-            for i in range(num_layers)
-        ])
-    
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
-        x = self.upsample(x)
-        x = torch.cat([x, skip], dim=1)
-        for layer in self.layers:
-            x = layer(x, time_emb)
-        return x
-
-
-class MiddleBlock(nn.Module):
-    """
-    Middle block with attention.
-    """
-    def __init__(self, channels: int, time_emb_dim: int):
-        super().__init__()
-        self.block1 = ResidualBlock(channels, channels, time_emb_dim, use_attention=True)
-        self.block2 = ResidualBlock(channels, channels, time_emb_dim, use_attention=False)
-    
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
-        x = self.block1(x, time_emb)
-        x = self.block2(x, time_emb)
-        return x
-
-
-class SR3UNet(nn.Module):
-    """
-    U-Net architecture for SR3 diffusion model.
-    Conditions on low-resolution images for super-resolution.
-    Works with LR input at original resolution (no upsampling required).
-    """
-    def __init__(
-        self,
-        in_channels: int = 1,
-        out_channels: int = 1,
-        base_channels: int = 64,
-        channel_multipliers: Tuple[int, ...] = (1, 2, 4, 8),
-        num_res_blocks: int = 2,
-        time_emb_dim: int = 256,
-        attention_resolutions: Tuple[int, ...] = (16,),
-        dropout: float = 0.1,
-        image_size: int = 128,
-        lr_scale: int = 2
-    ):
-        super().__init__()
-        
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.image_size = image_size
-        self.lr_scale = lr_scale
-        
-        # Time embedding
-        self.time_mlp = nn.Sequential(
-            SinusoidalPositionEmbeddings(base_channels),
-            nn.Linear(base_channels, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim)
-        )
-        
-        # Initial convolution for noisy high-res input
-        self.init_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
-        
-        # Conditioning: upsample LR then project
-        # This matches the U-Net approach where LR is upsampled internally
-        self.cond_upsample = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, base_channels, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(base_channels, base_channels, 3, padding=1)
-        )
-        
-        # Downsampling path
-        self.downs = nn.ModuleList()
-        channels = [base_channels]
-        now_channels = base_channels
-        
-        for i, mult in enumerate(channel_multipliers):
-            out_ch = base_channels * mult
-            use_attention = (image_size // (2 ** i)) in attention_resolutions
-            
-            self.downs.append(
-                DownBlock(
-                    now_channels,
-                    out_ch,
-                    time_emb_dim,
-                    num_res_blocks,
-                    use_attention
-                )
-            )
-            now_channels = out_ch
-            channels.append(now_channels)
-        
-        # Middle
-        self.middle = MiddleBlock(now_channels, time_emb_dim)
-        
-        # Upsampling path
-        self.ups = nn.ModuleList()
-        for i, mult in enumerate(reversed(channel_multipliers)):
-            out_ch = base_channels * mult
-            use_attention = (image_size // (2 ** (len(channel_multipliers) - i - 1))) in attention_resolutions
-            
-            self.ups.append(
-                UpBlock(
-                    now_channels,
-                    out_ch,
-                    time_emb_dim,
-                    num_res_blocks + 1,
-                    use_attention
-                )
-            )
-            now_channels = out_ch
-        
-        # Final output
-        self.final = nn.Sequential(
-            nn.GroupNorm(32, base_channels),
-            nn.SiLU(),
-            nn.Conv2d(base_channels, out_channels, 3, padding=1)
-        )
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        time: torch.Tensor,
-        cond: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Forward pass of SR3 U-Net.
-        
-        Args:
-            x: Noisy high-resolution image [B, C, H, W]
-            time: Diffusion timestep [B]
-            cond: Low-resolution conditioning image [B, C, H/2, W/2]
-        
-        Returns:
-            Predicted noise [B, C, H, W]
-        """
-        # Time embedding
-        time_emb = self.time_mlp(time)
-        
-        # Upsample and project conditioning (LR -> HR resolution)
-        cond_emb = self.cond_upsample(cond)
-        
-        # Initial projection with conditioning
-        x = self.init_conv(x)
-        x = x + cond_emb
-        
-        # Encoder
-        skips = []
-        for down in self.downs:
-            x, skip = down(x, time_emb)
-            skips.append(skip)
-        
-        # Middle
-        x = self.middle(x, time_emb)
-        
-        # Decoder
-        for up in self.ups:
-            skip = skips.pop()
-            x = up(x, skip, time_emb)
-        
-        # Final
-        x = self.final(x)
-        
-        return x
-
-
-class GaussianDiffusion:
-    """
-    Gaussian diffusion process for SR3.
-    Implements training and sampling procedures.
-    """
-    def __init__(
-        self,
-        model: SR3UNet,
-        timesteps: int = 1000,
-        beta_schedule: str = 'linear',
-        beta_start: float = 1e-4,
-        beta_end: float = 0.02
-    ):
+# ---------------------------------------------------------------
+# EMA helper class
+# ---------------------------------------------------------------
+class EMA:
+    """Exponential Moving Average for model parameters"""
+    def __init__(self, model, decay=0.9999):
         self.model = model
-        self.timesteps = timesteps
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
         
-        # Define beta schedule
-        if beta_schedule == 'linear':
-            betas = torch.linspace(beta_start, beta_end, timesteps)
-        elif beta_schedule == 'cosine':
-            betas = self._cosine_beta_schedule(timesteps)
-        else:
-            raise ValueError(f"Unknown beta schedule: {beta_schedule}")
-        
-        # Pre-compute diffusion parameters
-        self.betas = betas
-        self.alphas = 1.0 - betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
-        
-        # Calculations for diffusion q(x_t | x_{t-1}) and others
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        
-        # Calculations for posterior q(x_{t-1} | x_t, x_0)
-        self.posterior_variance = (
-            betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
-        )
+        # Initialize shadow parameters
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
     
-    def _cosine_beta_schedule(self, timesteps: int, s: float = 0.008) -> torch.Tensor:
-        """
-        Cosine schedule as proposed in Nichol & Dhariwal (2021).
-        """
-        steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.9999)
+    def update(self):
+        """Update shadow parameters"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
     
-    def q_sample(
-        self,
-        x_start: torch.Tensor,
-        t: torch.Tensor,
-        noise: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Forward diffusion process: q(x_t | x_0)
-        """
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        
-        sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_start.shape)
-        sqrt_one_minus_alphas_cumprod_t = self._extract(
-            self.sqrt_one_minus_alphas_cumprod, t, x_start.shape
-        )
-        
-        return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+    def apply_shadow(self):
+        """Apply shadow parameters to model"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
     
-    def p_losses(
-        self,
-        x_start: torch.Tensor,
-        cond: torch.Tensor,
-        t: torch.Tensor,
-        noise: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Calculate training loss.
-        
-        Args:
-            x_start: High-resolution ground truth [B, C, H, W]
-            cond: Low-resolution conditioning [B, C, H, W]
-            t: Timestep [B]
-            noise: Optional noise tensor
-        
-        Returns:
-            Loss value
-        """
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        
-        # Forward diffusion
-        x_noisy = self.q_sample(x_start, t, noise)
-        
-        # Predict noise
-        predicted_noise = self.model(x_noisy, t, cond)
-        
-        # Simple MSE loss
-        loss = F.mse_loss(predicted_noise, noise)
-        
-        return loss
+    def restore(self):
+        """Restore original parameters"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+        self.backup = {}
     
-    @torch.no_grad()
-    def p_sample(
-        self,
-        x: torch.Tensor,
-        cond: torch.Tensor,
-        t: int,
-        t_index: int
-    ) -> torch.Tensor:
-        """
-        Sample x_{t-1} from x_t.
-        """
-        device = x.device
-        batch_size = x.shape[0]
-        
-        # Create time tensor
-        t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
-        
-        # Predict noise
-        predicted_noise = self.model(x, t_tensor, cond)
-        
-        # Extract parameters
-        betas_t = self._extract(self.betas, t_tensor, x.shape)
-        sqrt_one_minus_alphas_cumprod_t = self._extract(
-            self.sqrt_one_minus_alphas_cumprod, t_tensor, x.shape
-        )
-        sqrt_recip_alphas_t = self._extract(
-            torch.sqrt(1.0 / self.alphas), t_tensor, x.shape
-        )
-        
-        # Equation 11 in DDPM paper
-        model_mean = sqrt_recip_alphas_t * (
-            x - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t
-        )
-        
-        if t_index == 0:
-            return model_mean
-        else:
-            posterior_variance_t = self._extract(self.posterior_variance, t_tensor, x.shape)
-            noise = torch.randn_like(x)
-            return model_mean + torch.sqrt(posterior_variance_t) * noise
+    def state_dict(self):
+        return self.shadow
     
-    @torch.no_grad()
-    def p_sample_loop(
-        self,
-        cond: torch.Tensor,
-        shape: Tuple[int, ...],
-        return_all_timesteps: bool = False
-    ) -> torch.Tensor:
-        """
-        Generate samples through reverse diffusion process.
-        
-        Args:
-            cond: Low-resolution conditioning image [B, C, H, W]
-            shape: Shape of output (B, C, H, W)
-            return_all_timesteps: Whether to return intermediate timesteps
-        
-        Returns:
-            Generated high-resolution image
-        """
-        device = cond.device
-        batch_size = shape[0]
-        
-        # Start from pure noise
-        img = torch.randn(shape, device=device)
-        
-        imgs = []
-        
-        for i in reversed(range(0, self.timesteps)):
-            img = self.p_sample(img, cond, i, i)
-            if return_all_timesteps:
-                imgs.append(img)
-        
-        if return_all_timesteps:
-            return torch.stack(imgs, dim=1)
-        else:
-            return img
-    
-    @torch.no_grad()
-    def sample(
-        self,
-        cond: torch.Tensor,
-        batch_size: int = 1
-    ) -> torch.Tensor:
-        """
-        Generate super-resolved images.
-        
-        Args:
-            cond: Low-resolution input [B, C, H, W]
-            batch_size: Batch size (should match cond batch size)
-        
-        Returns:
-            Super-resolved image [B, C, H, W]
-        """
-        image_size = self.model.image_size
-        channels = self.model.in_channels
-        
-        return self.p_sample_loop(
-            cond,
-            shape=(batch_size, channels, image_size, image_size)
-        )
-    
-    def _extract(self, a: torch.Tensor, t: torch.Tensor, x_shape: Tuple[int, ...]) -> torch.Tensor:
-        """
-        Extract values from a 1-D tensor for a batch of indices.
-        """
-        batch_size = t.shape[0]
-        out = a.to(t.device).gather(0, t)
-        return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict
 
 
-def create_sr3_model(
-    image_size: int = 128,
-    in_channels: int = 1,
-    base_channels: int = 64,
-    timesteps: int = 1000,
-    beta_schedule: str = 'linear',
-    lr_scale: int = 2
-) -> Tuple[SR3UNet, GaussianDiffusion]:
+# ---------------------------------------------------------------
+def train_one_epoch(model, diffusion, loader, optimizer, device, grad_clip=1.0, ema=None):
+    """Train SR3 for one epoch"""
+    model.train()
+    total_loss = 0.0
+    
+    for lr_img, hr_img in tqdm(loader, desc="Train", leave=False):
+        lr_img, hr_img = lr_img.to(device), hr_img.to(device)
+        
+        # Sample random timesteps
+        batch_size = hr_img.shape[0]
+        t = torch.randint(0, diffusion.timesteps, (batch_size,), device=device).long()
+        
+        # Calculate loss (model handles LR->HR upsampling internally)
+        loss = diffusion.p_losses(hr_img, lr_img, t)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        
+        optimizer.step()
+        
+        # Update EMA
+        if ema is not None:
+            ema.update()
+        
+        total_loss += loss.item()
+    
+    return total_loss / len(loader)
+
+
+# ---------------------------------------------------------------
+@torch.no_grad()
+def validate(model, diffusion, loader, device, num_samples=50):
     """
-    Factory function to create SR3 model and diffusion process.
-    
-    Args:
-        image_size: Size of high-resolution output
-        in_channels: Number of input channels
-        base_channels: Base number of channels in U-Net
-        timesteps: Number of diffusion steps
-        beta_schedule: Noise schedule ('linear' or 'cosine')
-        lr_scale: Upsampling scale factor (2 for 2x SR)
-    
-    Returns:
-        Tuple of (model, diffusion)
+    Validate SR3 model.
+    Note: Full sampling is slow, so we limit validation samples.
     """
-    model = SR3UNet(
-        in_channels=in_channels,
-        out_channels=in_channels,
-        base_channels=base_channels,
-        channel_multipliers=(1, 2, 4, 8),
-        num_res_blocks=2,
-        time_emb_dim=base_channels * 4,
-        attention_resolutions=(16,),
-        dropout=0.1,
-        image_size=image_size,
-        lr_scale=lr_scale
-    )
+    model.eval()
+    psnrs, ssims = [], []
     
-    diffusion = GaussianDiffusion(
-        model=model,
-        timesteps=timesteps,
-        beta_schedule=beta_schedule
-    )
+    sample_count = 0
+    for lr_img, hr_img in tqdm(loader, desc="Val", leave=False):
+        if sample_count >= num_samples:
+            break
+        
+        lr_img, hr_img = lr_img.to(device), hr_img.to(device)
+        batch_size = lr_img.shape[0]
+        
+        # Generate samples (model handles LR->HR upsampling internally)
+        pred = diffusion.sample(lr_img, batch_size=batch_size)
+        
+        # Calculate metrics
+        psnrs.append(calculate_psnr(pred, hr_img))
+        ssims.append(calculate_ssim(pred, hr_img))
+        
+        sample_count += batch_size
     
-    return model, diffusion
+    if len(psnrs) == 0:
+        return 0.0, 0.0
+    
+    psnr_mean = float(torch.tensor(psnrs).mean())
+    ssim_mean = float(torch.tensor(ssims).mean())
+    return psnr_mean, ssim_mean
 
 
-if __name__ == "__main__":
-    # Test the model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Create model
+# ---------------------------------------------------------------
+def main():
+    args = parse_args()
+    os.makedirs(args.save_dir, exist_ok=True)
+    device = args.device
+
+    print("=" * 60)
+    print("SpinOff SR3 Training")
+    print("=" * 60)
+    print(f"📂 Using device: {device}")
+    print(f"🔹 Loading splits: {args.splits}")
+    print(f"🔹 Image size: {args.image_size}")
+    print(f"🔹 Timesteps: {args.timesteps}")
+    print(f"🔹 Beta schedule: {args.beta_schedule}")
+    print(f"🔹 Base channels: {args.base_channels}")
+    print(f"🔹 Use EMA: {args.use_ema}")
+    print("=" * 60)
+
+    # Create data loaders
+    train_loader, val_loader = make_dataloaders(
+        splits_file=args.splits,
+        batch_size=args.batch_size,
+        create_lr_on_fly=args.create_lr_on_fly,
+        scale_factor=args.scale,
+        noise_level=args.noise_level
+    )
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+
+    # Create SR3 model and diffusion process
     model, diffusion = create_sr3_model(
-        image_size=128,
+        image_size=args.image_size,
         in_channels=1,
-        base_channels=64,
-        timesteps=1000
+        base_channels=args.base_channels,
+        timesteps=args.timesteps,
+        beta_schedule=args.beta_schedule,
+        lr_scale=args.scale
     )
     model = model.to(device)
     
@@ -638,23 +259,127 @@ if __name__ == "__main__":
     diffusion.sqrt_one_minus_alphas_cumprod = diffusion.sqrt_one_minus_alphas_cumprod.to(device)
     diffusion.posterior_variance = diffusion.posterior_variance.to(device)
     
-    # Test forward pass
-    batch_size = 2
-    x_hr = torch.randn(batch_size, 1, 128, 128).to(device)  # High-res ground truth
-    x_lr = torch.randn(batch_size, 1, 128, 128).to(device)  # Low-res condition
-    t = torch.randint(0, 1000, (batch_size,)).to(device)
-    
-    # Test training
-    loss = diffusion.p_losses(x_hr, x_lr, t)
-    print(f"Training loss: {loss.item():.4f}")
-    
-    # Test sampling
-    with torch.no_grad():
-        samples = diffusion.sample(x_lr, batch_size=batch_size)
-    print(f"Sample shape: {samples.shape}")
-    
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal parameters: {total_params:,}")
+    print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    
+    # EMA
+    ema = EMA(model, decay=args.ema_decay) if args.use_ema else None
+
+    # ===== Resume logic (exactly matching train_unet.py) =====
+    start_epoch = 1
+    best_psnr = -1.0
+    checkpoint_path = os.path.join(args.save_dir, "sr3_final.pt")
+
+    if os.path.exists(checkpoint_path):
+        print(f"🔄 Resuming from checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device)
+
+        if "model_state" in ckpt:
+            # New format - full checkpoint
+            model.load_state_dict(ckpt["model_state"])
+            if "optimizer_state" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            if "ema_state" in ckpt and ema is not None:
+                ema.load_state_dict(ckpt["ema_state"])
+            start_epoch = ckpt["epoch"] + 1
+            best_psnr = ckpt.get("best_psnr", -1.0)
+            print(f"➡️ Resuming from epoch {start_epoch} | Best PSNR: {best_psnr:.4f}")
+
+        else:
+            # Old format – weights only
+            model.load_state_dict(ckpt)
+            inferred = infer_last_epoch(args.save_dir)
+            if inferred > 0:
+                start_epoch = inferred + 1
+                print(f"⚙️ Found epoch files → resume from epoch {start_epoch}")
+            else:
+                start_epoch = 3
+                print("⚙️ No epoch files → default resume from epoch 3")
+
+    else:
+        print("⚠️ No checkpoint found — starting fresh.")
+
+    # ======================================================
+    # Training Loop
+    # ======================================================
+    for epoch in range(start_epoch, args.epochs + 1):
+        print(f"\n{'=' * 60}")
+        print(f"Epoch {epoch}/{args.epochs}")
+        print(f"{'=' * 60}")
+
+        # Train
+        train_loss = train_one_epoch(
+            model, diffusion, train_loader, optimizer, device, 
+            grad_clip=args.grad_clip, ema=ema
+        )
+        
+        # Validate (with EMA if enabled)
+        if ema is not None:
+            ema.apply_shadow()
+        
+        val_psnr, val_ssim = validate(model, diffusion, val_loader, device)
+        
+        if ema is not None:
+            ema.restore()
+
+        print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | "
+              f"Val PSNR: {val_psnr:.4f} | Val SSIM: {val_ssim:.4f}")
+
+        # Update best_psnr BEFORE saving
+        if val_psnr > best_psnr:
+            best_psnr = val_psnr
+
+        # Prepare checkpoint
+        ckpt = {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "best_psnr": best_psnr,
+            "train_loss": train_loss,
+            "val_psnr": val_psnr,
+            "val_ssim": val_ssim,
+            "config": {
+                "image_size": args.image_size,
+                "timesteps": args.timesteps,
+                "beta_schedule": args.beta_schedule,
+                "base_channels": args.base_channels,
+                "scale_factor": args.scale,
+                "noise_level": args.noise_level
+            }
+        }
+        
+        # Add EMA state if used
+        if ema is not None:
+            ckpt["ema_state"] = ema.state_dict()
+
+        # Save best
+        if val_psnr >= best_psnr:
+            best_path = os.path.join(args.save_dir, "sr3_best.pt")
+            torch.save(ckpt, best_path)
+            print(f"✅ New best saved: {best_path}")
+
+        # Save epoch checkpoint
+        epoch_path = os.path.join(args.save_dir, f"sr3_epoch{epoch}.pt")
+        torch.save(ckpt, epoch_path)
+        
+        # Save latest
+        latest_path = os.path.join(args.save_dir, "sr3_latest.pt")
+        torch.save(ckpt, latest_path)
+
+    # Save final checkpoint
+    final_path = os.path.join(args.save_dir, "sr3_final.pt")
+    torch.save(ckpt, final_path)
+    print(f"\n{'=' * 60}")
+    print(f"🎯 Training finished. Final saved to: {final_path}")
+    print(f"Best val PSNR: {best_psnr:.4f}")
+    print(f"{'=' * 60}")
+
+
+if __name__ == "__main__":
+    main()
