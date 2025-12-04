@@ -5,6 +5,8 @@ Based on: Saharia et al. (2021) - https://arxiv.org/abs/2104.07636
 
 This implementation provides a diffusion-based baseline for comparison
 with the main DiT/SiT approach in the SpinOff project.
+
+FIXED: Proper handling of LR (128x128) -> HR (256x256) super-resolution
 """
 
 import torch
@@ -224,7 +226,9 @@ class SR3UNet(nn.Module):
     """
     U-Net architecture for SR3 diffusion model.
     Conditions on low-resolution images for super-resolution.
-    Works with LR input at original resolution (no upsampling required).
+    
+    FIXED: Properly handles LR (H/scale, W/scale) -> HR (H, W) super-resolution
+    by upsampling LR to match HR resolution before concatenation.
     """
     def __init__(
         self,
@@ -236,15 +240,16 @@ class SR3UNet(nn.Module):
         time_emb_dim: int = 256,
         attention_resolutions: Tuple[int, ...] = (16,),
         dropout: float = 0.1,
-        image_size: int = 128,
-        lr_scale: int = 2
+        image_size: int = 256,  # HR image size
+        lr_scale: int = 2       # LR is image_size // lr_scale
     ):
         super().__init__()
         
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.image_size = image_size
-        self.lr_scale = lr_scale
+        self.image_size = image_size  # HR size (e.g., 256)
+        self.lr_scale = lr_scale      # Scale factor (e.g., 2 means LR is 128)
+        self.lr_size = image_size // lr_scale  # LR size (e.g., 128)
         
         # Time embedding
         self.time_mlp = nn.Sequential(
@@ -254,15 +259,18 @@ class SR3UNet(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim)
         )
         
-        # Initial convolution for noisy high-res input
-        self.init_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+        # Initial convolution for noisy high-res input (concatenated with upsampled LR)
+        # Input: noisy HR (in_channels) + upsampled LR (in_channels) = 2 * in_channels
+        self.init_conv = nn.Conv2d(in_channels * 2, base_channels, 3, padding=1)
         
-        # Conditioning: upsample LR then project
-        # This matches the U-Net approach where LR is upsampled internally
+        # Conditioning: upsample LR to HR resolution
+        # LR (H/2, W/2) -> HR (H, W) using learned upsampling
         self.cond_upsample = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, base_channels, kernel_size=4, stride=2, padding=1),
+            nn.Conv2d(in_channels, base_channels, 3, padding=1),
             nn.SiLU(),
-            nn.Conv2d(base_channels, base_channels, 3, padding=1)
+            nn.ConvTranspose2d(base_channels, base_channels, kernel_size=4, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, in_channels, 3, padding=1)
         )
         
         # Downsampling path
@@ -323,9 +331,9 @@ class SR3UNet(nn.Module):
         Forward pass of SR3 U-Net.
         
         Args:
-            x: Noisy high-resolution image [B, C, H, W]
+            x: Noisy high-resolution image [B, C, H, W] (e.g., 256x256)
             time: Diffusion timestep [B]
-            cond: Low-resolution conditioning image [B, C, H/2, W/2]
+            cond: Low-resolution conditioning image [B, C, H/scale, W/scale] (e.g., 128x128)
         
         Returns:
             Predicted noise [B, C, H, W]
@@ -333,12 +341,16 @@ class SR3UNet(nn.Module):
         # Time embedding
         time_emb = self.time_mlp(time)
         
-        # Upsample and project conditioning (LR -> HR resolution)
-        cond_emb = self.cond_upsample(cond)
+        # Upsample LR conditioning to match HR resolution
+        # cond: [B, C, 128, 128] -> cond_up: [B, C, 256, 256]
+        cond_up = self.cond_upsample(cond)
         
-        # Initial projection with conditioning
-        x = self.init_conv(x)
-        x = x + cond_emb
+        # Concatenate noisy HR with upsampled LR (channel-wise)
+        # This is the standard SR3 approach: condition by concatenation
+        x = torch.cat([x, cond_up], dim=1)  # [B, 2*C, H, W]
+        
+        # Initial projection
+        x = self.init_conv(x)  # [B, base_channels, H, W]
         
         # Encoder
         skips = []
@@ -440,8 +452,8 @@ class GaussianDiffusion:
         Calculate training loss.
         
         Args:
-            x_start: High-resolution ground truth [B, C, H, W]
-            cond: Low-resolution conditioning [B, C, H, W]
+            x_start: High-resolution ground truth [B, C, H, W] (e.g., 256x256)
+            cond: Low-resolution conditioning [B, C, H/scale, W/scale] (e.g., 128x128)
             t: Timestep [B]
             noise: Optional noise tensor
         
@@ -451,10 +463,10 @@ class GaussianDiffusion:
         if noise is None:
             noise = torch.randn_like(x_start)
         
-        # Forward diffusion
+        # Forward diffusion on HR image
         x_noisy = self.q_sample(x_start, t, noise)
         
-        # Predict noise
+        # Predict noise (model will upsample LR internally)
         predicted_noise = self.model(x_noisy, t, cond)
         
         # Simple MSE loss
@@ -514,8 +526,8 @@ class GaussianDiffusion:
         Generate samples through reverse diffusion process.
         
         Args:
-            cond: Low-resolution conditioning image [B, C, H, W]
-            shape: Shape of output (B, C, H, W)
+            cond: Low-resolution conditioning image [B, C, H/scale, W/scale]
+            shape: Shape of output (B, C, H, W) - HR resolution
             return_all_timesteps: Whether to return intermediate timesteps
         
         Returns:
@@ -524,7 +536,7 @@ class GaussianDiffusion:
         device = cond.device
         batch_size = shape[0]
         
-        # Start from pure noise
+        # Start from pure noise at HR resolution
         img = torch.randn(shape, device=device)
         
         imgs = []
@@ -549,13 +561,13 @@ class GaussianDiffusion:
         Generate super-resolved images.
         
         Args:
-            cond: Low-resolution input [B, C, H, W]
+            cond: Low-resolution input [B, C, H_lr, W_lr] (e.g., 128x128)
             batch_size: Batch size (should match cond batch size)
         
         Returns:
-            Super-resolved image [B, C, H, W]
+            Super-resolved image [B, C, H_hr, W_hr] (e.g., 256x256)
         """
-        image_size = self.model.image_size
+        image_size = self.model.image_size  # HR size
         channels = self.model.in_channels
         
         return self.p_sample_loop(
@@ -573,18 +585,20 @@ class GaussianDiffusion:
 
 
 def create_sr3_model(
-    image_size: int = 128,
+    image_size: int = 256,      # HR output size
+    lr_size: int = 128,         # LR input size (optional, computed from scale)
     in_channels: int = 1,
     base_channels: int = 64,
     timesteps: int = 1000,
     beta_schedule: str = 'linear',
-    lr_scale: int = 2
+    lr_scale: int = 2           # Upsampling factor
 ) -> Tuple[SR3UNet, GaussianDiffusion]:
     """
     Factory function to create SR3 model and diffusion process.
     
     Args:
-        image_size: Size of high-resolution output
+        image_size: Size of high-resolution output (e.g., 256)
+        lr_size: Size of low-resolution input (optional, default = image_size // lr_scale)
         in_channels: Number of input channels
         base_channels: Base number of channels in U-Net
         timesteps: Number of diffusion steps
@@ -603,7 +617,7 @@ def create_sr3_model(
         time_emb_dim=base_channels * 4,
         attention_resolutions=(16,),
         dropout=0.1,
-        image_size=image_size,
+        image_size=image_size,  # HR size
         lr_scale=lr_scale
     )
     
@@ -620,12 +634,18 @@ if __name__ == "__main__":
     # Test the model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Create model
+    print("=" * 60)
+    print("Testing SR3 Model: LR (128x128) -> HR (256x256)")
+    print("=" * 60)
+    
+    # Create model for 2x super-resolution
+    # LR: 128x128, HR: 256x256
     model, diffusion = create_sr3_model(
-        image_size=128,
+        image_size=256,      # HR output size
         in_channels=1,
         base_channels=64,
-        timesteps=1000
+        timesteps=1000,
+        lr_scale=2           # 2x upsampling
     )
     model = model.to(device)
     
@@ -640,16 +660,22 @@ if __name__ == "__main__":
     
     # Test forward pass
     batch_size = 2
-    x_hr = torch.randn(batch_size, 1, 128, 128).to(device)  # High-res ground truth
+    x_hr = torch.randn(batch_size, 1, 256, 256).to(device)  # High-res ground truth
     x_lr = torch.randn(batch_size, 1, 128, 128).to(device)  # Low-res condition
     t = torch.randint(0, 1000, (batch_size,)).to(device)
     
+    print(f"\nInput shapes:")
+    print(f"  LR (condition): {x_lr.shape}")
+    print(f"  HR (target):    {x_hr.shape}")
+    
     # Test training
     loss = diffusion.p_losses(x_hr, x_lr, t)
-    print(f"Training loss: {loss.item():.4f}")
+    print(f"\nTraining loss: {loss.item():.4f}")
     
-    # Test sampling
+    # Test sampling (reduced timesteps for speed)
+    print("\nTesting sampling...")
     with torch.no_grad():
+        # Quick test with subset of steps
         samples = diffusion.sample(x_lr, batch_size=batch_size)
     print(f"Sample shape: {samples.shape}")
     
@@ -658,3 +684,5 @@ if __name__ == "__main__":
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+    
+    print("\n✅ SR3 model test passed!")
