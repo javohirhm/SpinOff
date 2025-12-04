@@ -1,6 +1,8 @@
 """
 Resume-capable trainer for SpinOff SR3 Super-Resolution.
 Fully compatible with your training workflow and checkpoint system.
+
+FIXED: Proper handling of LR (128x128) -> HR (256x256) super-resolution
 """
 
 import os
@@ -54,13 +56,18 @@ def parse_args():
     p.add_argument("--noise_level", type=float, default=0.02, help="Noise level for degradation")
 
     # SR3 specific arguments
-    p.add_argument("--image_size", type=int, default=128, help="High-res image size")
+    # NOTE: image_size is the HR output size, LR will be image_size // scale
+    p.add_argument("--image_size", type=int, default=256, help="High-res output image size")
     p.add_argument("--timesteps", type=int, default=1000, help="Number of diffusion steps")
     p.add_argument("--beta_schedule", type=str, default="linear", choices=["linear", "cosine"])
     p.add_argument("--base_channels", type=int, default=64, help="Base channels in U-Net")
     p.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
     p.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate")
     p.add_argument("--use_ema", action="store_true", help="Use exponential moving average")
+    
+    # Validation settings
+    p.add_argument("--val_samples", type=int, default=50, help="Number of validation samples")
+    p.add_argument("--val_timesteps", type=int, default=None, help="Reduced timesteps for faster validation (optional)")
 
     return p.parse_args()
 
@@ -155,7 +162,9 @@ def train_one_epoch(model, diffusion, loader, optimizer, device, grad_clip=1.0, 
         batch_size = hr_img.shape[0]
         t = torch.randint(0, diffusion.timesteps, (batch_size,), device=device).long()
         
-        # Calculate loss (model handles LR->HR upsampling internally)
+        # Calculate loss
+        # hr_img: [B, C, 256, 256] - target HR image
+        # lr_img: [B, C, 128, 128] - LR condition (model handles upsampling internally)
         loss = diffusion.p_losses(hr_img, lr_img, t)
         
         optimizer.zero_grad()
@@ -194,7 +203,8 @@ def validate(model, diffusion, loader, device, num_samples=50):
         lr_img, hr_img = lr_img.to(device), hr_img.to(device)
         batch_size = lr_img.shape[0]
         
-        # Generate samples (model handles LR->HR upsampling internally)
+        # Generate samples
+        # lr_img: [B, C, 128, 128] -> pred: [B, C, 256, 256]
         pred = diffusion.sample(lr_img, batch_size=batch_size)
         
         # Calculate metrics
@@ -216,13 +226,17 @@ def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     device = args.device
+    
+    # Compute LR size from HR size and scale
+    lr_size = args.image_size // args.scale
 
     print("=" * 60)
     print("SpinOff SR3 Training")
     print("=" * 60)
     print(f"📂 Using device: {device}")
     print(f"🔹 Loading splits: {args.splits}")
-    print(f"🔹 Image size: {args.image_size}")
+    print(f"🔹 HR image size: {args.image_size}")
+    print(f"🔹 LR image size: {lr_size} (scale factor: {args.scale}x)")
     print(f"🔹 Timesteps: {args.timesteps}")
     print(f"🔹 Beta schedule: {args.beta_schedule}")
     print(f"🔹 Base channels: {args.base_channels}")
@@ -238,10 +252,25 @@ def main():
         noise_level=args.noise_level
     )
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    
+    # Verify data dimensions
+    sample_lr, sample_hr = next(iter(train_loader))
+    print(f"Data shapes - LR: {sample_lr.shape}, HR: {sample_hr.shape}")
+    
+    # Sanity check dimensions
+    expected_lr_size = args.image_size // args.scale
+    if sample_lr.shape[-1] != expected_lr_size or sample_hr.shape[-1] != args.image_size:
+        print(f"⚠️ WARNING: Data dimensions don't match expected sizes!")
+        print(f"   Expected LR: {expected_lr_size}x{expected_lr_size}, Got: {sample_lr.shape[-2]}x{sample_lr.shape[-1]}")
+        print(f"   Expected HR: {args.image_size}x{args.image_size}, Got: {sample_hr.shape[-2]}x{sample_hr.shape[-1]}")
+        print(f"   Adjusting image_size to match data...")
+        args.image_size = sample_hr.shape[-1]
+        args.scale = sample_hr.shape[-1] // sample_lr.shape[-1]
+        print(f"   New settings - HR: {args.image_size}, Scale: {args.scale}x")
 
     # Create SR3 model and diffusion process
     model, diffusion = create_sr3_model(
-        image_size=args.image_size,
+        image_size=args.image_size,  # HR output size
         in_channels=1,
         base_channels=args.base_channels,
         timesteps=args.timesteps,
@@ -323,7 +352,8 @@ def main():
         if ema is not None:
             ema.apply_shadow()
         
-        val_psnr, val_ssim = validate(model, diffusion, val_loader, device)
+        val_psnr, val_ssim = validate(model, diffusion, val_loader, device, 
+                                       num_samples=args.val_samples)
         
         if ema is not None:
             ema.restore()
