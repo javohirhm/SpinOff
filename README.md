@@ -18,6 +18,7 @@ The goal is to reconstruct high-quality medical images from low-dose simulations
 ## Dataset
 
 Original IXI dataset - https://brain-development.org/ixi-dataset/
+
 IXI dataset (3d to 2d) - https://drive.google.com/drive/folders/1tvy2f7bHvSRiuRfDd0bX7sIp09xb7q0u?usp=sharing
 
 ## 🚀 Quick Start
