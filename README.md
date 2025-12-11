@@ -15,6 +15,10 @@ This project implements and compares three super-resolution approaches for medic
 
 The goal is to reconstruct high-quality medical images from low-dose simulations using the IXI MRI dataset.
 
+## Dataset
+
+IXI dataset - https://drive.google.com/drive/folders/1tvy2f7bHvSRiuRfDd0bX7sIp09xb7q0u?usp=sharing
+
 ## 🚀 Quick Start
 
 ### Installation
