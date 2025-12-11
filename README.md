@@ -1,4 +1,4 @@
-[# Diffusion Super-Resolution for Low-Dose CT/MRI
+# Diffusion Super-Resolution for Low-Dose CT/MRI
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -17,7 +17,8 @@ The goal is to reconstruct high-quality medical images from low-dose simulations
 
 ## Dataset
 
-IXI dataset - https://drive.google.com/drive/folders/1tvy2f7bHvSRiuRfDd0bX7sIp09xb7q0u?usp=sharing
+Original IXI dataset - https://brain-development.org/ixi-dataset/
+IXI dataset (3d to 2d) - https://drive.google.com/drive/folders/1tvy2f7bHvSRiuRfDd0bX7sIp09xb7q0u?usp=sharing
 
 ## 🚀 Quick Start
 
