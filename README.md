@@ -9,9 +9,9 @@ Official implementation for "Diffusion Super-Resolution for Low-Dose CT/MRI" - C
 ## 📋 Project Overview
 
 This project implements and compares three super-resolution approaches for medical image enhancement:
-- **U-Net** (CNN baseline)
-- **ESRGAN** (GAN baseline) 
-- **DDPM** (Diffusion model - our proposed method)
+- **Bicubic** (Simple baseline)
+- **SR3** (SR baseline) 
+- **SR3-FiLM Model** (Our proposed method)
 
 The goal is to reconstruct high-quality medical images from low-dose simulations using the IXI MRI dataset.
 
