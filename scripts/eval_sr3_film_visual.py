@@ -1,0 +1,204 @@
+import os
+import torch
+import torch.nn.functional as F
+import numpy as np
+from torch.utils.data import DataLoader
+from pathlib import Path
+import matplotlib.pyplot as plt
+import json
+from tqdm import tqdm
+
+# SR3-FiLM model
+from models.sr3_film import create_sr3_film_model
+
+# Dataset
+from data.dataset import MRIDataset
+
+
+# --------------------------------------------------------------
+# Save LR / SR / HR triplet
+# --------------------------------------------------------------
+def save_visual(lr, sr, hr, out_file):
+    lr = lr.squeeze().cpu().numpy()
+    sr = sr.squeeze().cpu().numpy()
+    hr = hr.squeeze().cpu().numpy()
+
+    plt.figure(figsize=(12, 4))
+
+    plt.subplot(1, 3, 1)
+    plt.title("Low-Resolution Input")
+    plt.imshow(lr, cmap="gray")
+    plt.axis("off")
+
+    plt.subplot(1, 3, 2)
+    plt.title("SR3-FiLM Output")
+    plt.imshow(sr, cmap="gray")
+    plt.axis("off")
+
+    plt.subplot(1, 3, 3)
+    plt.title("Ground Truth (HR)")
+    plt.imshow(hr, cmap="gray")
+    plt.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(out_file, dpi=150)
+    plt.close()
+
+
+# --------------------------------------------------------------
+# Main
+# --------------------------------------------------------------
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=r"C:\Users\MSI\Desktop\SpinOff-main\results\eval_sr3_film\sr3_film_best.pt",
+    )
+
+    parser.add_argument(
+        "--splits",
+        type=str,
+        default=r"C:\Users\MSI\Desktop\SpinOff-main\data\IXI\processed\png_slices\splits.json",
+    )
+
+    parser.add_argument("--save_dir", type=str, default="results/eval_sr3_film_visual")
+    parser.add_argument("--num_samples", type=int, default=1)
+    parser.add_argument("--create_lr_on_fly", action="store_true")
+    parser.add_argument("--fast", action="store_true")
+
+    args = parser.parse_args()
+
+    # --------------------------------------------------------------
+    # Device
+    # --------------------------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("DEVICE:", device)
+
+    # --------------------------------------------------------------
+    # Load test split
+    # --------------------------------------------------------------
+    with open(args.splits, "r") as f:
+        splits = json.load(f)
+
+    test_paths = splits["test"]
+    print("Total test slices:", len(test_paths))
+
+    test_paths = test_paths[: args.num_samples]
+    print("Evaluating ONLY:", len(test_paths))
+
+    # --------------------------------------------------------------
+    # Dataset & loader  (NO image_size argument!)
+    # --------------------------------------------------------------
+    test_ds = MRIDataset(
+        hr_paths=test_paths,
+        lr_paths=None,
+        create_lr_on_fly=True,
+        scale_factor=2,
+        noise_level=0.02,
+        noise_type="gaussian"
+    )
+
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
+
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # --------------------------------------------------------------
+    # Load SR3-FiLM model
+    # --------------------------------------------------------------
+    print("Loading SR3-FiLM model...")
+    model, diffusion = create_sr3_film_model()
+    model = model.to(device)
+    model.eval()
+
+    print("Loading checkpoint:", args.checkpoint)
+    ckpt = torch.load(args.checkpoint, map_location=device)
+
+    if "model_state" in ckpt:
+        print("Loading model_state")
+        model.load_state_dict(ckpt["model_state"], strict=False)
+    elif "state_dict" in ckpt:
+        print("Loading state_dict")
+        model.load_state_dict(ckpt["state_dict"], strict=False)
+    else:
+        print("Loading checkpoint directly")
+        model.load_state_dict(ckpt, strict=False)
+
+    # EMA support
+    if "ema_state" in ckpt:
+        try:
+            model.load_state_dict(ckpt["ema_state"], strict=False)
+            print("EMA loaded.")
+        except:
+            print("EMA load failed.")
+
+    diffusion.model = model
+
+    # --------------------------------------------------------------
+    # Sampler
+    # --------------------------------------------------------------
+    if args.fast and hasattr(diffusion, "sample_fast"):
+        sampler = diffusion.sample_fast
+        print("Using FAST sampler")
+    else:
+        sampler = diffusion.sample
+        print("Using FULL sampler")
+
+    # --------------------------------------------------------------
+    # Evaluation loop
+    # --------------------------------------------------------------
+    results = []
+
+    for i, (lr, hr) in enumerate(tqdm(test_loader)):
+        lr = lr.to(device)
+        hr = hr.to(device)
+
+        with torch.no_grad():
+            try:
+                sr = sampler(cond=lr, batch_size=1)
+            except:
+                sr = sampler(lr, batch_size=1)
+
+        # ---------------- Metrics --------------------
+        mse = F.mse_loss(sr, hr).item()
+        psnr = -10 * np.log10(mse + 1e-8)
+
+        mu_x, mu_y = hr.mean().item(), sr.mean().item()
+        sigma_x, sigma_y = hr.var().item(), sr.var().item()
+        sigma_xy = ((hr - mu_x) * (sr - mu_y)).mean().item()
+
+        C1 = 0.01**2
+        C2 = 0.03**2
+        ssim = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / \
+               ((mu_x**2 + mu_y**2 + C1) * (sigma_x + sigma_y + C2))
+
+        results.append({"psnr": psnr, "ssim": ssim})
+
+        # ---------------- Save Image -----------------
+        out_path = save_dir / f"sample_{i:03d}.png"
+        save_visual(lr, sr, hr, out_path)
+        print("Saved:", out_path)
+
+    # ---------------- Summary -----------------------
+    mean_psnr = float(np.mean([r["psnr"] for r in results]))
+    mean_ssim = float(np.mean([r["ssim"] for r in results]))
+
+    metrics = {
+        "num_samples": len(results),
+        "mean_psnr": mean_psnr,
+        "mean_ssim": mean_ssim
+    }
+
+    with open(save_dir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=4)
+
+    print("\n=== SR3-FiLM EVALUATION COMPLETE ===")
+    print("PSNR:", mean_psnr)
+    print("SSIM:", mean_ssim)
+
+
+if __name__ == "__main__":
+    main()
