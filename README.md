@@ -52,39 +52,27 @@ Predicted noise ε̂
 
 ## 🧪 Google Colab Notebooks
 
-### **1. Bicubic Baseline — Training + Results (Full Pipeline)**  
+### **1. Bicubic Baseline — Training + Results**
+
 All bicubic training, evaluation, and visual outputs are available here:  
 👉 https://colab.research.google.com/drive/1v77SN-VDLmxrJjmDwiikr-s3xILpIm9B?usp=sharing
 
-This notebook performs:
-
-- LR generation  
-- 2× bicubic super-resolution  
-- PSNR / SSIM evaluation  
-- HR vs LR vs Bicubic comparisons  
-
 ---
 
-### **2. SR3 Sampling Notebook (SR3-FiLM removed)**  
+### **2. SR3 Sampling Notebook (SR3-FiLM removed)**
+
 Sampling experiments for SR3 model and early SR3-FiLM attempts.  
-SR3-FiLM failed and is **not included in the final report**.
+SR3-FiLM was removed from the final report due to instability.
 
 👉 https://colab.research.google.com/drive/1Hq7EfXlEdcQ_HpTVwQQalRJfOZBSrkp8#scrollTo=Bb77WrzCwPn5
-
-Includes:
-
-- SR3 forward diffusion  
-- Reverse sampling (1000 steps)  
-- Visual SR samples  
-- FiLM tests (discarded in final project)  
 
 ---
 
 ## 📈 Results Comparison
 
-| Method       | PSNR (↑) | SSIM (↑) | Notes |
-|--------------|----------|----------|-------|
-| Bicubic      | 29.93 dB | 0.7778   | Smooth, stable baseline |
+| Method       | PSNR (↑) | SSIM (↑) | Comments |
+|--------------|----------|----------|----------|
+| Bicubic      | 29.93 dB | 0.7778   | Strong classical baseline |
 | SR3 (ours)   | 19.53 dB | 0.2630   | Underfitting due to limited training |
 
 ---
@@ -130,17 +118,17 @@ https://drive.google.com/drive/folders/1oaR17lrwzlEUqSmqazDStAzBkD8pHdqF?usp=sha
 
 ---
 
-## 📁 Project Structure
+## 📁 Repository Structure
 
 ```
 SpinOff/
-│── bicubic/
-│── sr3/
-│── utils/
-│── data/
-│── train_sr3.py
-│── evaluate.py
-│── requirements.txt
+│── data/               # Preprocessed IXI data
+│── models/             # Saved model weights
+│── scripts/            # Training / sampling scripts
+│── utils/              # Dataset loaders, evaluation metrics
+│── INDEX.md            # Project index
+│── ROADMAP.md          # Roadmap and future plans
+│── requirements.txt    # Dependencies
 └── README.md
 ```
 
@@ -149,7 +137,7 @@ SpinOff/
 ## 🤝 Contributors
 
 - **Gulrukhsor Akhmadjanova**  
-- **Javokhir Khoshimov**
+- **Javokhir Hoshimov**
 
 ---
 
@@ -161,4 +149,4 @@ Released under the **MIT License**.
 
 ## ⭐ Acknowledgements
 
-Built using the IXI Dataset and inspired by SR3 (Saharia et al., 2021) and DDPM (Ho et al., 2020).
+This work uses the IXI Dataset and builds on diffusion models such as SR3 (Saharia et al., 2021) and DDPM (Ho et al., 2020).
