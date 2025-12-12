@@ -113,7 +113,7 @@ Outputs include:
 
 ## 📦 Pretrained Models & Outputs
 
-Download trained SR3 checkpoints and sample outputs:  
+Download trained SR3 the best model weights:  
 https://drive.google.com/drive/folders/1oaR17lrwzlEUqSmqazDStAzBkD8pHdqF?usp=sharing
 
 ---
