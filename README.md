@@ -52,9 +52,9 @@ Predicted noise ε̂
 
 ## 🧪 Google Colab Notebooks
 
-### **1. Bicubic Baseline — Training + Results**
+### **1. Bicubic Baseline **
 
-All bicubic training, evaluation, and visual outputs are available here:  
+All bicubic evaluation, and visual outputs are available here:  
 👉 https://colab.research.google.com/drive/1v77SN-VDLmxrJjmDwiikr-s3xILpIm9B?usp=sharing
 
 ---
